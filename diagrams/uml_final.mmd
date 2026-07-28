@@ -1,66 +1,69 @@
 classDiagram
   class Owner {
-    +String name
-    +String work_schedule
     +int available_hours
-    +String preferred_morning_start
-    +String preferred_evening_end
+    +String name
     +List pets
-    +get_name()
-    +get_availability()
-    +set_availability()
+    +String preferred_evening_end
+    +String preferred_morning_start
+    +String work_schedule
     +add_pet()
     +get_all_tasks()
+    +get_availability()
+    +get_name()
+    +set_availability()
   }
 
   class Pet {
-    +String name
-    +String species
-    +String gender
     +int age
+    +String gender
     +String health_history
     +String medical_needs
+    +String name
     +Owner owner
+    +String species
     +List tasks
-    +get_name()
-    +get_species()
+    +add_task()
     +get_age()
     +get_medical_needs()
-    +add_task()
-    +get_tasks()
+    +get_name()
     +get_pending_tasks()
+    +get_species()
+    +get_tasks()
     +mark_task_complete()
   }
 
   class Task {
-    +String name
-    +int duration
-    +int priority
-    +String type
-    +String scheduled_time
-    +bool is_completed
-    +String frequency
+    +bool attention_required
     +date due_date
-    +get_name()
+    +int duration
+    +String frequency
+    +bool is_completed
+    +String name
+    +int priority
+    +String scheduled_time
+    +String type
     +get_duration()
+    +get_name()
     +get_priority()
     +get_type()
-    +set_priority()
     +mark_complete()
+    +set_priority()
   }
 
   class Scheduler {
+    +List attempt_log
+    +List generated_plan
     +Owner owner
     +List pets
-    +List tasks
-    +List generated_plan
     +String reasoning
-    +generate_plan()
+    +List tasks
     +detect_conflicts()
-    +sort_by_time()
-    +filter_plan()
-    +explain_reasoning()
     +display_plan()
+    +explain_reasoning()
+    +filter_plan()
+    +generate_plan()
+    +revise_plan()
+    +sort_by_time()
     -_collect_tasks()
     -_priority_label()
     -_time_to_minutes()
@@ -72,3 +75,4 @@ classDiagram
   Scheduler "1" --> "1" Owner : reads availability
   Scheduler "1" --> "1..*" Pet : schedules for
   Scheduler "1" --> "0..*" Task : organizes
+  Scheduler --> Scheduler : revise_plan() re-checks via detect_conflicts()
