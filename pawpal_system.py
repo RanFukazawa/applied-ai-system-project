@@ -161,6 +161,19 @@ class Pet:
 @dataclass
 class Task:
     """Represents a single pet care activity."""
+
+    # Task types that require the owner's active attention at all (as opposed
+    # to feeding/medication, which are brief enough to happen unsupervised in
+    # parallel across pets).
+    _ATTENTION_REQUIRED_TYPES = {"walk", "grooming", "enrichment"}
+
+    # Of the attention-required types, these need the owner's FULL, undivided
+    # presence and cannot be combined across pets — you can't groom two pets
+    # or run focused enrichment play with two pets at once. "walk" is
+    # deliberately excluded: many owners walk multiple dogs together on one
+    # outing, so it's attention-required but not cross-pet exclusive.
+    _EXCLUSIVE_ATTENTION_TYPES = {"grooming", "enrichment"}
+
     name: str
     duration: int                     # in minutes
     priority: int                     # 1 (highest) to 5 (lowest)
@@ -169,10 +182,14 @@ class Task:
     is_completed: bool = False
     frequency: str = "once"           # "once", "daily", "weekly"
     due_date: date = field(default_factory=date.today)
+    attention_required: bool = field(init=False, default=False)
+    exclusive_attention: bool = field(init=False, default=False)
 
     def __post_init__(self):
-        """Normalize scheduled_time to HH:MM format on creation."""
+        """Normalize scheduled_time and derive attention flags from type."""
         self.scheduled_time = normalize_time(self.scheduled_time)
+        self.attention_required = self.type in self._ATTENTION_REQUIRED_TYPES
+        self.exclusive_attention = self.type in self._EXCLUSIVE_ATTENTION_TYPES
 
     def get_name(self) -> str:
         """Return the task name."""
@@ -189,6 +206,15 @@ class Task:
     def get_type(self) -> str:
         """Return the task type."""
         return self.type
+
+    def get_attention_required(self) -> bool:
+        """Return whether this task requires the owner's active attention."""
+        return self.attention_required
+
+    def get_exclusive_attention(self) -> bool:
+        """Return whether this task requires the owner's full, undivided
+        presence and cannot be combined with a task for another pet."""
+        return self.exclusive_attention
  
     def set_priority(self, priority: int) -> None:
         """Update the task's priority level. Must be between 1 and 5."""
@@ -211,12 +237,28 @@ class Task:
  
 @dataclass
 class Scheduler:
-    """Sorts and fits all pet tasks within the owner's available hours to produce a daily plan."""
+    """
+    Sorts and fits all pet tasks within the owner's available hours to produce
+    a daily plan, then runs an agentic self-correction loop: detect conflicts,
+    shift the losing task, and re-check, up to a bounded number of attempts.
+    """
     owner: Owner
     pets: List[Pet] = field(default_factory=list)
     tasks: List[Task] = field(default_factory=list)
     generated_plan: List[dict] = field(default_factory=list)
     reasoning: str = ""
+    attempt_log: List[dict] = field(default_factory=list)
+    unresolved_conflicts: List[str] = field(default_factory=list)
+
+    DEFAULT_MAX_REVISION_ATTEMPTS = 5
+
+    # Minutes of breathing room added after the winning task ends when the
+    # agent shifts a losing task. Without this, a shifted task starts the
+    # instant the other one finishes (e.g. grooming starting the same minute
+    # a walk ends), which is technically non-overlapping but unrealistic —
+    # real transitions (coming back inside, settling one pet before turning
+    # to the next) take a few minutes even if nothing is formally scheduled.
+    SHIFT_BUFFER_MINUTES = 5
  
     def _collect_tasks(self) -> List[Task]:
         """Gather all pending tasks from all pets."""
@@ -225,9 +267,33 @@ class Scheduler:
             for task in pet.get_pending_tasks():
                 all_tasks.append((pet, task))
         return all_tasks
- 
-    def generate_plan(self) -> List[dict]:
-        """Sort all pending tasks by priority and duration, fit them into available hours, and return the plan."""
+
+    @staticmethod
+    def _make_entry(pet: Pet, task:Task) -> dict:
+        """
+        Build a plan-row dict for a (pet, task) pair. Keeps a hidden Task reference (`_task`) so the 
+        agentic loop can mutate the real object when it revises a schedule, not just the display dict. 
+        """
+        return {
+            "pet": pet.name,
+            "task": task.name,
+            "type": task.type,
+            "duration": task.duration,
+            "priority": task.priority,
+            "scheduled_time": task.scheduled_time,
+            "is_completed": task.is_completed,
+            "frequency": task.frequency,
+            "attention_required": task.attention_required,
+            "exclusive_attention": task.exclusive_attention,
+            "_task": task,
+        }
+    
+    def generate_plan(self, max_revision_attempts: int = DEFAULT_MAX_REVISION_ATTEMPTS) -> List[dict]:
+        """
+        Sort all pending tasks by priority and duration, fit them into available hours,
+        sort chronologically, then run the agentic conflict-resolution loop before returning
+        the finalized plan.
+        """
         available_minutes = self.owner.available_hours * 60
         pet_task_pairs = self._collect_tasks()
  
@@ -240,27 +306,21 @@ class Scheduler:
  
         for pet, task in pet_task_pairs:
             if scheduled_minutes + task.duration <= available_minutes:
-                plan.append({
-                    "pet": pet.name,
-                    "task": task.name,
-                    "type": task.type,
-                    "duration": task.duration,
-                    "priority": task.priority,
-                    "scheduled_time": task.scheduled_time,
-                    "is_completed": task.is_completed,
-                    "frequency": task.frequency,
-                })
+                plan.append(self._make_entry(pet, task))
                 scheduled_minutes += task.duration
             else:
                 skipped.append(f"{task.name} for {pet.name}")
- 
-        self.generated_plan = plan
-        self.tasks = [pt[1] for pt in pet_task_pairs]
 
-        # Sort the final plan chronologically by scheduled_time
-        self.generated_plan = self.sort_by_time(self.generated_plan)
+
+        self.tasks = [pt[1] for pt in pet_task_pairs]
+        
+        # Sort the plan chronologically by scheduled_time
+        self.generated_plan = self.sort_by_time(plan)
+
+        # Agentic self-correction loop
+        self._run_agentic_loop(max_revision_attempts)
  
-        # Build reasoning string
+        # Build reasoning string (static summary of the initial fit/sort pass)
         priority_counts = {"high": 0, "medium": 0, "low": 0}
         for entry in plan:
             label = self._priority_label(entry["priority"])
@@ -281,27 +341,181 @@ class Scheduler:
         self.reasoning = " ".join(reasons)
  
         return self.generated_plan
+
+    def _run_agentic_loop(self, max_attempts: int) -> None:
+        """
+        Agentic loop: check for conflicts, revise (shift) one at a time, and re-check,
+        up to max_attempts. Never loops indefinitely; if conflicts remain after the
+        attempt budget is exhausted, logs a clear final 'unresolved' entry instead of
+        silently dropping or crashing.
+        """
+        self.attempt_log = []
+        attempts_used = 0
+        loop_active = True
+
+        while attempts_used < max_attempts and loop_active:
+            conflicts = self.detect_conflicts()
+
+            if not conflicts:
+                loop_active = False
+            else:
+                attempts_used += 1
+                result = self.revise_plan()
+
+                if not result.get("resolved"):
+                    # Defensive: detect_conflicts() found something but revise_plan()
+                    # could not identify a fix. Stop rather than loop
+                    self.attempt_log.append({
+                        "attempt": attempts_used,
+                        "status": "no valid shift found; stopping",
+                    })
+                    loop_active = False
+                else:
+                    self.attempt_log.append({
+                        "attempt": attempts_used,
+                        "status": "shifted",
+                        "conflict": result["conflict"],
+                        "shifted_task": result["shifted_task"],
+                        "shifted_pet": result["shifted_pet"],
+                        "old_time": result["old_time"],
+                        "new_time": result["new_time"],
+                    })
+
+        self.unresolved_conflicts = self.detect_conflicts()
+        if self.unresolved_conflicts:
+            self.attempt_log.append({
+                "attempt":  None,
+                "status": (
+                    f"stopped after {attempts_used} attempt(s); "
+                    f"{len(self.unresolved_conflicts)} conflict(s) remain unresolved"
+                ),
+            })
+
+    @staticmethod
+    def _is_real_conflict(prev: dict, curr: dict) -> bool:
+        """
+        Determine whether an overlapping pair of plan entries is a REAL
+        scheduling conflict:
+          - Same pet, any task types -> conflict (a pet can't do two things
+            at once, regardless of attention level).
+          - Different pets -> conflict only if BOTH tasks require the owner's
+            active attention AND at least one of them demands the owner's
+            full, undivided presence (grooming, enrichment). Two combinable
+            attention-required tasks for different pets (e.g. walking two
+            dogs together) are NOT a conflict.
+        """
+        if prev["pet"] == curr["pet"]:
+            return True
+
+        both_attention = prev.get("attention_required", False) and curr.get("attention_required", False)
+        either_exclusive = prev.get("exclusive_attention", False) or curr.get("exclusive_attention", False)
+        return both_attention and either_exclusive
+
+    def revise_plan(self) -> dict:
+        """
+        Find the first real conflict in the current plan and shift the losing
+        task to start SHIFT_BUFFER_MINUTES after the winning task ends.
+
+        Tie-break rules:
+          - Lower-priority task shifts.
+          - If priorities are equal, the shorter-duration task shifts.
+          - If both are equal, the later task in the current sort order shifts
+            (deterministic fallback so repeated runs behave identically).
+
+        A zero-gap back-to-back shift is technically non-overlapping but
+        unrealistic -- real transitions between tasks (and between pets) take
+        a few minutes even if nothing is formally scheduled in between, so a
+        small buffer is added on top of the overlap when the agent shifts a
+        task. This buffer only applies to agent-driven shifts; it does not
+        change how the original human-entered schedule is treated.
+
+        Returns a dict describing what was done, or {"resolved": False} if no
+        real conflict was found to revise.
+        """
+        timed = [e for e in self.generated_plan if e["scheduled_time"]]
  
+        for i in range(1, len(timed)):
+            prev = timed[i - 1]
+            curr = timed[i]
+ 
+            prev_start = self._time_to_minutes(prev["scheduled_time"])
+            prev_end = prev_start + prev["duration"]
+            curr_start = self._time_to_minutes(curr["scheduled_time"])
+ 
+            if curr_start >= prev_end:
+                continue  # no overlap between this adjacent pair
+ 
+            if not self._is_real_conflict(prev, curr):
+                continue  # overlap exists but isn't a *real* conflict under the attention-aware rule
+ 
+            # Capture original times before anything is mutated, for an accurate log message
+            prev_time_display = prev["scheduled_time"]
+            curr_time_display = curr["scheduled_time"]
+ 
+            # Decide which task shifts
+            if prev["priority"] != curr["priority"]:
+                loser, winner = (prev, curr) if prev["priority"] > curr["priority"] else (curr, prev)
+            elif prev["duration"] != curr["duration"]:
+                loser, winner = (prev, curr) if prev["duration"] < curr["duration"] else (curr, prev)
+            else:
+                loser, winner = curr, prev  # deterministic fallback
+ 
+            old_time = loser["scheduled_time"]
+            new_start_minutes = (
+                self._time_to_minutes(winner["scheduled_time"])
+                + winner["duration"]
+                + self.SHIFT_BUFFER_MINUTES
+            )
+            new_time = self._minutes_to_time(new_start_minutes)
+ 
+            # Apply the shift to both the real Task object and the display dict
+            loser["_task"].scheduled_time = new_time
+            loser["scheduled_time"] = new_time
+ 
+            self.generated_plan = self.sort_by_time(self.generated_plan)
+ 
+            return {
+                "resolved": True,
+                "conflict": (
+                    f"[{curr['pet']}] '{curr['task']}' at {curr_time_display} "
+                    f"vs [{prev['pet']}] '{prev['task']}' at {prev_time_display}"
+                ),
+                "shifted_task": loser["task"],
+                "shifted_pet": loser["pet"],
+                "old_time": old_time,
+                "new_time": new_time,
+            }
+ 
+        return {"resolved": False}
+    
     def detect_conflicts(self) -> List[str]:
         """
-        Scan the sorted plan for overlapping tasks.
+        Scan the sorted plan for overlapping tasks, using the attention-aware rule:
+        a real conflict is either (a) two tasks for the 'same' pet overlapping,
+        regardless of type, or (b) two tasks for 'different' pets overlapping where
+        both require the owner's active attention AND at least one of them demands
+        the owner's full, undivided presence (grooming, enrichment). Two combinable
+        attention-required tasks for different pets (e.g. walking two dogs together)
+        are NOT flagged, nor are cross-pet overlaps of low-attention tasks (e.g. two
+        breakfasts at the same time).
         A conflict occurs when a task's start time falls before the previous task finishes.
         Returns a list of warning strings (empty list = no conflicts).
         """
         warnings = []
-        # Only check tasks that have a real scheduled_time
         timed = [e for e in self.generated_plan if e["scheduled_time"]]
 
         for i in range(1, len(timed)):
             prev = timed[i - 1]
             curr = timed[i]
 
-            # Convert "HH:MM" to total minutes for arithmetic
             prev_start = self._time_to_minutes(prev["scheduled_time"])
             prev_end   = prev_start + prev["duration"]
             curr_start = self._time_to_minutes(curr["scheduled_time"])
 
             if curr_start < prev_end:
+                if not self._is_real_conflict(prev, curr):
+                    continue
+
                 overlap = prev_end - curr_start
                 warnings.append(
                     f"⚠️  Conflict: [{curr['pet']}] '{curr['task']}' at {curr['scheduled_time']} "
@@ -317,6 +531,13 @@ class Scheduler:
         hours, minutes = map(int, time_str.split(":"))
         return hours * 60 + minutes
 
+    @staticmethod
+    def _minutes_to_time(total_minutes: int) -> str:
+        """Convert total minutes since midnight back to a 'H:MM' string."""
+        total_minutes = total_minutes % (24 * 60)
+        hours, minutes = divmod(total_minutes, 60)
+        return f"{hours:02d}:{minutes:02d}"
+    
     @staticmethod
     def sort_by_time(plan: List[dict]) -> List[dict]:
         """Sort a plan list chronologically; tasks with no scheduled_time go to the end."""
@@ -340,10 +561,30 @@ class Scheduler:
         return result
 
     def explain_reasoning(self) -> str:
-        """Return a human-readable explanation of how the plan was generated."""
+        """
+        Return a human-readable explanation of how the plan was generated, including a summary of 
+        the agent's conflict-resolution attempts (not just the final state).
+        """
         if not self.reasoning:
             return "No plan has been generated yet. Call generate_plan() first."
-        return self.reasoning
+
+        parts = [self.reasoning]
+
+        if self.attempt_log:
+            parts.append("Agentic conflict resolution:")
+            for entry in self.attempt_log:
+                if entry.get("status") == "shifted":
+                    parts.append(
+                        f"Attempt {entry['attempt']}: shifted {entry['shifted_pet']}'s "
+                        f"'{entry['shifted_task']}' from {entry['old_time']} to {entry['new_time']} "
+                        f"to resolve a conflict with {entry['conflict']}."
+                    )
+                elif entry.get("attempt") is None:
+                    parts.append(entry["status"].capitalize() + ".")
+                else:
+                    parts.append(f"Attempt {entry['attempt']}: {entry['status']}.")
+                        
+        return " ".join(parts)
  
     @staticmethod
     def _priority_label(priority: int) -> str:
