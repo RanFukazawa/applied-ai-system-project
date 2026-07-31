@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 from datetime import date, timedelta
+import json
+from pathlib import Path
 
 
 def normalize_time(time_str: str) -> str:
@@ -27,8 +29,58 @@ def normalize_time(time_str: str) -> str:
         return f"{hours:02d}:{minutes:02d}"
     except ValueError:
         return ""
- 
- 
+
+
+# ---------------------------------------------------------------------------
+# Task type classification rules
+#
+# Which task types need the owner's active attention, and which of those need
+# FULL, undivided attention (can't be split across pets) vs. are combinable
+# (e.g. walking two dogs together). This used to be two hardcoded Python sets
+# on the Task class; it now lives in task_rules.json so new types can be
+# added by editing that file, with no code changes required anywhere.
+# ---------------------------------------------------------------------------
+_TASK_RULES_FILENAME = "task_rules.json"
+
+# In-code fallback, used only if task_rules.json is missing or malformed, so
+# the app degrades gracefully instead of crashing on a bad/absent config file.
+_DEFAULT_TASK_RULES = {
+    "walk":       {"attention_required": True,  "exclusive_attention": False,
+                   "icon": "👀", "reason": "Needs your attention, but can be combined across pets."},
+    "grooming":   {"attention_required": True,  "exclusive_attention": True,
+                   "icon": "🔒", "reason": "Needs your full, undivided attention."},
+    "enrichment": {"attention_required": True,  "exclusive_attention": True,
+                   "icon": "🔒", "reason": "Needs your full, undivided attention."},
+    "feeding":    {"attention_required": False, "exclusive_attention": False,
+                   "icon": "🍽️", "reason": "Brief enough to happen for two pets in parallel."},
+    "medication": {"attention_required": False, "exclusive_attention": False,
+                   "icon": "💊", "reason": "Brief enough to happen for two pets in parallel."},
+    "other":      {"attention_required": True,  "exclusive_attention": True,
+                   "icon": "⭐️", "reason": "Not a recognized task type — assumed to need full attention as a safe default."},
+}
+
+
+def load_task_rules(path: Optional[str] = None) -> dict:
+    """
+    Load task-type classification rules from task_rules.json (next to this
+    file by default). Falls back to a small built-in default set if the file
+    is missing, unreadable, or malformed.
+    """
+    rules_path = Path(path) if path else Path(__file__).parent / _TASK_RULES_FILENAME
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            rules = json.load(f)
+        if not isinstance(rules, dict) or not rules:
+            raise ValueError("task_rules.json must contain a non-empty JSON object")
+        return rules
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return dict(_DEFAULT_TASK_RULES)
+
+
+# Loaded once at import time; every Task looks up its classification here.
+TASK_RULES = load_task_rules()
+
+
 @dataclass
 class Owner:
     """Represents a pet owner and their scheduling availability."""
@@ -162,34 +214,37 @@ class Pet:
 class Task:
     """Represents a single pet care activity."""
 
-    # Task types that require the owner's active attention at all (as opposed
-    # to feeding/medication, which are brief enough to happen unsupervised in
-    # parallel across pets).
-    _ATTENTION_REQUIRED_TYPES = {"walk", "grooming", "enrichment"}
-
-    # Of the attention-required types, these need the owner's FULL, undivided
-    # presence and cannot be combined across pets — you can't groom two pets
-    # or run focused enrichment play with two pets at once. "walk" is
-    # deliberately excluded: many owners walk multiple dogs together on one
-    # outing, so it's attention-required but not cross-pet exclusive.
-    _EXCLUSIVE_ATTENTION_TYPES = {"grooming", "enrichment"}
-
     name: str
     duration: int                     # in minutes
     priority: int                     # 1 (highest) to 5 (lowest)
-    type: str                         # "feeding", "walk", "medication", "grooming", "enrichment"
+    type: str                         # looked up in TASK_RULES (task_rules.json); unrecognized
+                                       # types default to no attention required
     scheduled_time: str = ""          # e.g. "08:00"
     is_completed: bool = False
     frequency: str = "once"           # "once", "daily", "weekly"
     due_date: date = field(default_factory=date.today)
     attention_required: bool = field(init=False, default=False)
     exclusive_attention: bool = field(init=False, default=False)
+    attention_reason: str = field(init=False, default="")
+    original_scheduled_time: str = field(init=False, default="")
 
     def __post_init__(self):
-        """Normalize scheduled_time and derive attention flags from type."""
+        """Normalize scheduled_time and derive attention flags from a
+        TASK_RULES lookup (task_rules.json). Unrecognized/custom types
+        default to attention_required=False rather than erroring, so a typo
+        or a brand-new type degrades safely instead of crashing.
+
+        original_scheduled_time is captured once here and is NEVER touched
+        again by anything else (in particular, revise_plan() only ever
+        mutates scheduled_time). This is what lets Scheduler.generate_plan()
+        offer a true "reset to what I actually entered" baseline, separate
+        from wherever the agent's shifts have left scheduled_time."""
         self.scheduled_time = normalize_time(self.scheduled_time)
-        self.attention_required = self.type in self._ATTENTION_REQUIRED_TYPES
-        self.exclusive_attention = self.type in self._EXCLUSIVE_ATTENTION_TYPES
+        self.original_scheduled_time = self.scheduled_time
+        rule = TASK_RULES.get(self.type, {})
+        self.attention_required = bool(rule.get("attention_required", False))
+        self.exclusive_attention = bool(rule.get("exclusive_attention", False))
+        self.attention_reason = rule.get("reason", "")
 
     def get_name(self) -> str:
         """Return the task name."""
@@ -215,6 +270,16 @@ class Task:
         """Return whether this task requires the owner's full, undivided
         presence and cannot be combined with a task for another pet."""
         return self.exclusive_attention
+
+    def get_attention_reason(self) -> str:
+        """Return the human-readable reason for this task type's attention
+        classification, as retrieved from task_rules.json."""
+        return self.attention_reason
+
+    def get_original_scheduled_time(self) -> str:
+        """Return the task's originally entered scheduled time, unaffected
+        by any agent-driven shifts made since."""
+        return self.original_scheduled_time
  
     def set_priority(self, priority: int) -> None:
         """Update the task's priority level. Must be between 1 and 5."""
@@ -249,6 +314,7 @@ class Scheduler:
     reasoning: str = ""
     attempt_log: List[dict] = field(default_factory=list)
     unresolved_conflicts: List[str] = field(default_factory=list)
+    skipped_tasks: List[str] = field(default_factory=list)
 
     DEFAULT_MAX_REVISION_ATTEMPTS = 5
 
@@ -285,18 +351,37 @@ class Scheduler:
             "frequency": task.frequency,
             "attention_required": task.attention_required,
             "exclusive_attention": task.exclusive_attention,
+            "attention_reason": task.attention_reason,
             "_task": task,
         }
     
-    def generate_plan(self, max_revision_attempts: int = DEFAULT_MAX_REVISION_ATTEMPTS) -> List[dict]:
+    def generate_plan(
+        self,
+        max_revision_attempts: int = DEFAULT_MAX_REVISION_ATTEMPTS,
+        reset_to_original: bool = False,
+    ) -> List[dict]:
         """
         Sort all pending tasks by priority and duration, fit them into available hours,
         sort chronologically, then run the agentic conflict-resolution loop before returning
         the finalized plan.
+
+        If reset_to_original is True, every pending task's scheduled_time is
+        first restored to its original_scheduled_time (what was actually
+        entered, before any prior agent shifts). This makes repeated calls
+        idempotent — the same current inputs always produce the same output,
+        rather than building on top of wherever a previous run's shifts left
+        things. If False (the default), any prior agent-driven shifts are
+        left as-is, and this run only reacts to what's changed since then
+        (e.g. newly added or removed tasks) — this is the "Refresh" behavior
+        in app.py, as opposed to "Generate", which resets.
         """
         available_minutes = self.owner.available_hours * 60
         pet_task_pairs = self._collect_tasks()
- 
+
+        if reset_to_original:
+            for _, task in pet_task_pairs:
+                task.scheduled_time = task.original_scheduled_time
+
         # Sort: priority ascending (1 first), then duration ascending
         pet_task_pairs.sort(key=lambda pt: (pt[1].priority, pt[1].duration))
  
@@ -313,6 +398,7 @@ class Scheduler:
 
 
         self.tasks = [pt[1] for pt in pet_task_pairs]
+        self.skipped_tasks = skipped
         
         # Sort the plan chronologically by scheduled_time
         self.generated_plan = self.sort_by_time(plan)
