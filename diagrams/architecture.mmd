@@ -1,34 +1,41 @@
 flowchart TD
     subgraph Input["Input"]
-        U[Owner, Pet, Task data<br/>entered via app.py or main.py]
+        U[Owner, Pet, Task data<br/>entered/edited via app.py or main.py]
+        RULES[(task_rules.json<br/>type -> attention_required,<br/>exclusive_attention, reason)]
+        RULES -.retrieved at Task creation<br/>and re-derived on edit.-> U
     end
 
     subgraph Agent["Agent - Scheduler (pawpal_system.py)"]
-        G[generate_plan<br/>sort by priority, duration,<br/>fit to available hours]
-        C[detect_conflicts<br/>attention-aware check]
-        R[revise_plan<br/>shift lower-priority or<br/>shorter-duration task]
+        G[generate_plan<br/>sort by priority, duration,<br/>fit to available hours,<br/>optional reset_to_original]
+        C[detect_conflicts<br/>same-pet: always;<br/>cross-pet: both attention-required<br/>+ at least one exclusive]
+        R[revise_plan<br/>shift lower-priority or<br/>shorter-duration task<br/>+ SHIFT_BUFFER_MINUTES]
         G --> C
         C -->|conflict found| R
         R --> C
-        C -->|no conflict or<br/>N attempts reached| FIN[finalize plan<br/>+ attempt log]
+        C -->|no conflict or<br/>N attempts reached| FIN[finalize plan<br/>+ attempt log<br/>+ skipped_tasks]
     end
 
     subgraph Output["Output"]
-        O[Plan, reasoning, conflict<br/>warnings shown in app.py]
+        O1[Streamlit UI - app.py<br/>timeline + Attention column,<br/>"Why this plan?" expander]
+        O2[Terminal demo - main.py]
     end
 
     subgraph Testing["Evaluator / Tester (tests/test_pawpal.py)"]
         T1[Regression tests:<br/>attention classification,<br/>conflict detection fix]
         T2[Convergence tests:<br/>fixable resolves,<br/>unfixable terminates cleanly]
         T3[Determinism test:<br/>same input, same output]
+        T4[Extensibility tests:<br/>task_rules.json loading,<br/>fallback, custom/unknown types]
+        T5[Generate vs. Refresh tests:<br/>original time preserved,<br/>edit + reset flips tie-break]
     end
 
     subgraph Human["Human in the loop"]
-        H[Owner reviews plan,<br/>edits tasks or availability]
+        H[Owner reviews plan,<br/>edits tasks in place,<br/>adds/removes pets or tasks,<br/>adjusts availability]
     end
 
     U --> G
-    FIN --> O
-    O --> H
-    H -->|revised input| U
+    FIN --> O1
+    FIN --> O2
+    O1 --> H
+    H -->|edit/add/delete:<br/>auto-regenerates incrementally| U
+    H -->|"Generate schedule":<br/>reset_to_original=True| U
     Agent -.validated by.-> Testing

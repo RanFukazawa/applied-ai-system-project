@@ -34,16 +34,23 @@ classDiagram
 
   class Task {
     +bool attention_required
+    +String attention_reason
     +date due_date
     +int duration
+    +bool exclusive_attention
     +String frequency
     +bool is_completed
     +String name
+    +String original_scheduled_time
     +int priority
     +String scheduled_time
     +String type
+    +get_attention_reason()
+    +get_attention_required()
     +get_duration()
+    +get_exclusive_attention()
     +get_name()
+    +get_original_scheduled_time()
     +get_priority()
     +get_type()
     +mark_complete()
@@ -56,7 +63,9 @@ classDiagram
     +Owner owner
     +List pets
     +String reasoning
+    +List skipped_tasks
     +List tasks
+    +List unresolved_conflicts
     +detect_conflicts()
     +display_plan()
     +explain_reasoning()
@@ -65,8 +74,18 @@ classDiagram
     +revise_plan()
     +sort_by_time()
     -_collect_tasks()
+    -_is_real_conflict()
+    -_make_entry()
+    -_minutes_to_time()
     -_priority_label()
+    -_run_agentic_loop()
     -_time_to_minutes()
+  }
+
+  class TaskRules {
+    <<module: task_rules.json>>
+    +dict TASK_RULES
+    +load_task_rules()
   }
 
   Owner "1" --> "1..*" Pet : owns
@@ -75,4 +94,5 @@ classDiagram
   Scheduler "1" --> "1" Owner : reads availability
   Scheduler "1" --> "1..*" Pet : schedules for
   Scheduler "1" --> "0..*" Task : organizes
-  Scheduler --> Scheduler : revise_plan() re-checks via detect_conflicts()
+  Scheduler --> Scheduler : _run_agentic_loop() calls revise_plan() + detect_conflicts()
+  Task ..> TaskRules : looks up type's classification in
