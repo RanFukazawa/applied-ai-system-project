@@ -16,7 +16,7 @@ flowchart TD
     end
 
     subgraph Output["Output"]
-        O1[Streamlit UI - app.py<br/>timeline + Attention column,<br/>"Why this plan?" expander]
+        O1[Streamlit UI - app.py<br/>timeline + Attention column,<br/>Why this plan? expander]
         O2[Terminal demo - main.py]
     end
 
@@ -37,5 +37,5 @@ flowchart TD
     FIN --> O2
     O1 --> H
     H -->|edit/add/delete:<br/>auto-regenerates incrementally| U
-    H -->|"Generate schedule":<br/>reset_to_original=True| U
+    H -->|Generate schedule button:<br/>reset_to_original=True| U
     Agent -.validated by.-> Testing
