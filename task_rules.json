@@ -1,0 +1,56 @@
+{
+  "walk": {
+    "attention_required": true,
+    "exclusive_attention": false,
+    "icon": "👀",
+    "reason": "Needs your attention, but can be combined across pets — e.g. walking two or more dogs together."
+  },
+  "grooming": {
+    "attention_required": true,
+    "exclusive_attention": true,
+    "icon": "🔒",
+    "reason": "Needs your full, undivided attention — can't overlap with another pet's task."
+  },
+  "enrichment": {
+    "attention_required": true,
+    "exclusive_attention": true,
+    "icon": "🔒",
+    "reason": "Needs your full, undivided attention — can't overlap with another pet's task."
+  },
+  "feeding": {
+    "attention_required": false,
+    "exclusive_attention": false,
+    "icon": "🍽️",
+    "reason": "Brief enough to happen for multiple pets in parallel — won't conflict with another pet's task."
+  },
+  "medication": {
+    "attention_required": false,
+    "exclusive_attention": false,
+    "icon": "💊",
+    "reason": "Brief enough to happen for multiple pets in parallel — won't conflict with another pet's task."
+  },
+  "dog_park": {
+    "attention_required": true,
+    "exclusive_attention": false,
+    "icon": "🐕",
+    "reason": "Needs supervision, but multiple dogs can go to the park together at once."
+  },
+  "vet_visit": {
+    "attention_required": true,
+    "exclusive_attention": true,
+    "icon": "🏥",
+    "reason": "Needs your full presence at the appointment — can't be split across pets unless they share the same visit."
+  },
+  "training": {
+    "attention_required": true,
+    "exclusive_attention": true,
+    "icon": "🎓",
+    "reason": "Needs focused one-on-one attention to be effective — can't be split across pets."
+  },
+  "other": {
+    "attention_required": true,
+    "exclusive_attention": true,
+    "icon": "⭐️",
+    "reason": "Not a recognized task type — assumed to need your full, undivided attention as a safe default. If you use this often, consider adding a specific type to task_rules.json instead."
+  }
+}
