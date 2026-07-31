@@ -4,7 +4,7 @@ Testing ground for verifying backend logic in the terminal.
 Run with: python main.py
 """
 
-from pawpal_system import Owner, Pet, Task, Scheduler
+from pawpal_system import Owner, Pet, Task, Scheduler, TASK_RULES
 from datetime import date
 
 
@@ -109,6 +109,29 @@ exclusive_scheduler.generate_plan()
 print("\n  Two dogs groomed at the same time (exclusive):")
 print(f"    conflicts: {exclusive_scheduler.detect_conflicts()}")
 print(f"    attempt_log: {exclusive_scheduler.attempt_log}")
+
+# --- 7c. Demo: task types come from task_rules.json, not hardcoded Python ---
+print("\n=== Task types are loaded from task_rules.json ===")
+print(f"  Available types: {list(TASK_RULES.keys())}")
+print("  New types (dog_park, vet_visit, training) work with zero code changes —")
+print("  they were added by editing task_rules.json, not pawpal_system.py.\n")
+
+rules_owner = Owner(name="Sam")
+rules_owner.set_availability(
+    work_schedule="remote", available_hours=4,
+    preferred_morning_start="07:00", preferred_evening_end="20:00",
+)
+buddy2 = Pet(name="Buddy", species="Dog", gender="Male", age=3)
+luna2 = Pet(name="Luna", species="Cat", gender="Female", age=2)
+buddy2.add_task(Task("Trip to the dog park", 45, priority=2, type="dog_park", scheduled_time="09:00"))
+luna2.add_task(Task("Annual checkup", 30, priority=1, type="vet_visit", scheduled_time="09:00"))
+rules_owner.add_pet(buddy2)
+rules_owner.add_pet(luna2)
+rules_scheduler = Scheduler(owner=rules_owner)
+rules_scheduler.generate_plan()
+print("  dog_park (combinable) vs. vet_visit (exclusive), different pets, same time:")
+print(f"    conflicts: {rules_scheduler.detect_conflicts()}")
+print(f"    attempt_log: {rules_scheduler.attempt_log}")
 
 # --- 8. Demo: recurring tasks ---
 print("\n=== Recurring task demo ===")
