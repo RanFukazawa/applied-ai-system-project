@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import pytest
 from datetime import date, timedelta
-from pawpal_system import Owner, Pet, Task, Scheduler
+from pawpal_system import Owner, Pet, Task, Scheduler, load_task_rules
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +266,11 @@ class TestConflictDetection:
 # ---------------------------------------------------------------------------
 # Test 6: Attention-required / exclusive-attention classification
 # ---------------------------------------------------------------------------
+# Classification now comes from TASK_RULES (loaded from task_rules.json),
+# not hardcoded Python sets, so new task types can be added by editing that
+# file with no code changes. These tests cover the existing 5 types, the new
+# extensibility-demo types, unrecognized types, and the loader's fallback
+# behavior when the config file is missing or malformed.
 
 class TestAttentionClassification:
 
@@ -275,20 +280,77 @@ class TestAttentionClassification:
         ("enrichment", True, True),
         ("feeding", False, False),
         ("medication", False, False),
+        ("dog_park", True, False),
+        ("vet_visit", True, True),
+        ("training", True, True),
+        ("other", True, True),
     ])
     def test_attention_flags_by_type(self, task_type, expected_attention, expected_exclusive):
         """
         Each task type should map to the correct attention_required and
-        exclusive_attention values. Only grooming/enrichment are exclusive —
-        walk requires the owner's attention but is combinable across pets
-        (e.g. walking two dogs together on one outing), so it must always
-        be attention_required=True but exclusive_attention=False.
+        exclusive_attention values, sourced from task_rules.json. Only
+        grooming/enrichment/vet_visit/training are exclusive — walk and
+        dog_park require the owner's attention but are combinable across
+        pets, so they must always be attention_required=True but
+        exclusive_attention=False.
         """
         task = Task("Test task", 10, priority=1, type=task_type)
         assert task.attention_required is expected_attention
         assert task.get_attention_required() is expected_attention
         assert task.exclusive_attention is expected_exclusive
         assert task.get_exclusive_attention() is expected_exclusive
+        assert task.attention_reason  # every recognized type should have a reason string
+
+    def test_unrecognized_type_defaults_to_no_attention(self):
+        """A type not present in TASK_RULES should default safely to no
+        attention required, rather than raising an error."""
+        task = Task("Mystery task", 10, priority=1, type="dance_party")
+        assert task.attention_required is False
+        assert task.exclusive_attention is False
+        assert task.get_attention_reason() == ""
+
+
+class TestTaskRulesLoading:
+
+    def test_missing_file_falls_back_to_defaults(self):
+        """If the rules file doesn't exist, load_task_rules() should return
+        the built-in default set rather than raising."""
+        rules = load_task_rules("/nonexistent/path/task_rules.json")
+        assert "walk" in rules
+        assert "grooming" in rules
+        assert rules["walk"]["attention_required"] is True
+        assert rules["walk"]["exclusive_attention"] is False
+        # The 'other' catch-all should survive even in degraded/fallback mode
+        assert "other" in rules
+        assert rules["other"]["attention_required"] is True
+        assert rules["other"]["exclusive_attention"] is True
+
+    def test_malformed_json_falls_back_to_defaults(self, tmp_path):
+        """A file that isn't valid JSON should also fall back gracefully."""
+        bad_file = tmp_path / "bad_rules.json"
+        bad_file.write_text("{not valid json")
+        rules = load_task_rules(str(bad_file))
+        assert "walk" in rules
+
+    def test_empty_object_falls_back_to_defaults(self, tmp_path):
+        """An empty JSON object is treated as invalid config, not zero types."""
+        empty_file = tmp_path / "empty_rules.json"
+        empty_file.write_text("{}")
+        rules = load_task_rules(str(empty_file))
+        assert "walk" in rules
+
+    def test_custom_rules_file_is_used_when_valid(self, tmp_path):
+        """A well-formed custom rules file should be used as-is, proving new
+        types can be added purely by editing the config."""
+        custom_file = tmp_path / "custom_rules.json"
+        custom_file.write_text(
+            '{"nail_trim": {"attention_required": true, "exclusive_attention": true, '
+            '"icon": "\\ud83d\\udc3e", "reason": "Needs full focus and a calm pet."}}'
+        )
+        rules = load_task_rules(str(custom_file))
+        assert "nail_trim" in rules
+        assert "walk" not in rules  # custom file fully replaces the default set
+        assert rules["nail_trim"]["attention_required"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +457,25 @@ class TestConflictDetectionFix:
         ]
         scheduler = self._scheduler_with_plan(sample_owner, plan)
         assert scheduler.detect_conflicts() == []
+
+    def test_cross_pet_other_type_overlap_flagged_by_default(self, sample_owner):
+        """
+        Two unrelated 'other'-type tasks for different pets should still be
+        flagged as a conflict. 'other' is a catch-all for anything not in
+        task_rules.json, so it defaults to the conservative assumption
+        (attention_required=True, exclusive_attention=True) — better to
+        over-warn on an unclassified task than silently miss a real conflict.
+        """
+        plan = [
+            {"pet": "Buddy", "task": "Photo shoot", "type": "other", "duration": 30,
+             "priority": 2, "scheduled_time": "10:00",
+             "attention_required": True, "exclusive_attention": True},
+            {"pet": "Luna", "task": "House sitter drop-off", "type": "other", "duration": 15,
+             "priority": 1, "scheduled_time": "10:00",
+             "attention_required": True, "exclusive_attention": True},
+        ]
+        scheduler = self._scheduler_with_plan(sample_owner, plan)
+        assert len(scheduler.detect_conflicts()) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -512,3 +593,173 @@ class TestDeterminism:
         first_statuses = [e.get("status") for e in first.attempt_log]
         second_statuses = [e.get("status") for e in second.attempt_log]
         assert first_statuses == second_statuses
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Generate (reset) vs. Refresh (incremental) behavior
+# ---------------------------------------------------------------------------
+# revise_plan() mutates Task.scheduled_time in place, so calling
+# generate_plan() repeatedly without a reset would build on top of whatever
+# a previous run's shifts already decided. original_scheduled_time is a
+# separate, never-mutated snapshot of what was actually entered, and
+# generate_plan(reset_to_original=True) uses it to give "Generate" a true,
+# idempotent clean-slate behavior distinct from "Refresh" (the default).
+
+class TestGenerateVsRefresh:
+
+    @staticmethod
+    def _build_conflicting_pet():
+        owner = Owner(name="Alex")
+        owner.set_availability(
+            work_schedule="office", available_hours=3,
+            preferred_morning_start="07:00", preferred_evening_end="20:00",
+        )
+        dog = Pet(name="Buddy", species="Dog", gender="Male", age=3)
+        dog.add_task(Task("Breakfast",  10, priority=1, type="feeding",    scheduled_time="07:00"))
+        dog.add_task(Task("Medication",  5, priority=1, type="medication", scheduled_time="07:05"))
+        owner.add_pet(dog)
+        return owner, dog
+
+    def test_original_scheduled_time_captured_on_creation(self):
+        """original_scheduled_time should match the normalized entered time."""
+        task = Task("Medication", 5, priority=1, type="medication", scheduled_time="7:5")
+        assert task.original_scheduled_time == "07:05"
+        assert task.get_original_scheduled_time() == "07:05"
+
+    def test_original_scheduled_time_survives_an_agent_shift(self):
+        """A shift changes scheduled_time but must never touch original_scheduled_time."""
+        owner, dog = self._build_conflicting_pet()
+        med = next(t for t in dog.get_tasks() if t.name == "Medication")
+        assert med.original_scheduled_time == "07:05"
+
+        scheduler = Scheduler(owner=owner)
+        scheduler.generate_plan()
+
+        assert med.scheduled_time == "07:15"          # shifted (07:10 end + 5 min buffer)
+        assert med.original_scheduled_time == "07:05"  # untouched
+
+    def test_reset_to_original_true_is_idempotent(self):
+        """generate_plan(reset_to_original=True) must give identical results
+        no matter how many times it's called with no other changes."""
+        owner, dog = self._build_conflicting_pet()
+        scheduler = Scheduler(owner=owner)
+
+        scheduler.generate_plan(reset_to_original=True)
+        first_shape = [(e["task"], e["scheduled_time"]) for e in scheduler.generated_plan]
+
+        scheduler.generate_plan(reset_to_original=True)
+        second_shape = [(e["task"], e["scheduled_time"]) for e in scheduler.generated_plan]
+
+        assert first_shape == second_shape
+
+    def test_reset_to_original_false_builds_on_prior_shift(self):
+        """
+        Without reset (the 'Refresh' behavior), a second call that finds
+        nothing new to resolve should leave the prior shift in place and log
+        no new attempts — it builds on top of the existing state rather than
+        replaying history.
+        """
+        owner, dog = self._build_conflicting_pet()
+        scheduler = Scheduler(owner=owner)
+
+        scheduler.generate_plan()  # default reset_to_original=False; shifts Medication
+        med = next(t for t in dog.get_tasks() if t.name == "Medication")
+        assert med.scheduled_time == "07:15"
+
+        scheduler.generate_plan()  # called again, no reset, nothing new to do
+        assert med.scheduled_time == "07:15"   # stays put
+        assert scheduler.attempt_log == []     # nothing needed fixing this time
+
+    def test_generate_and_refresh_can_produce_different_attempt_logs(self):
+        """
+        Adding a task after a prior shift should demonstrate the real
+        behavioral difference: Refresh (no reset) only reports the NEW work
+        needed, while Generate (reset) replays the full resolution history
+        from a clean baseline.
+        """
+        # Refresh path
+        owner_a, dog_a = self._build_conflicting_pet()
+        sched_a = Scheduler(owner=owner_a)
+        sched_a.generate_plan()
+        dog_a.add_task(Task("Quick check-in", 5, priority=2, type="other", scheduled_time="07:12"))
+        sched_a.generate_plan()  # no reset
+        refresh_attempts = len(sched_a.attempt_log)
+
+        # Generate path
+        owner_b, dog_b = self._build_conflicting_pet()
+        sched_b = Scheduler(owner=owner_b)
+        sched_b.generate_plan(reset_to_original=True)
+        dog_b.add_task(Task("Quick check-in", 5, priority=2, type="other", scheduled_time="07:12"))
+        sched_b.generate_plan(reset_to_original=True)
+        generate_attempts = len(sched_b.attempt_log)
+
+        # Generate (reset) must redo the original Breakfast/Medication shift
+        # plus the new conflict, so it logs strictly more attempts than
+        # Refresh, which only reports the new conflict.
+        assert generate_attempts > refresh_attempts
+
+    def test_editing_a_task_in_place_preserves_identity_and_original_time(self):
+        """
+        Mimics app.py's edit-form save handler: mutate the SAME Task object's
+        fields, then re-invoke __post_init__() to refresh derived attention
+        flags and reset original_scheduled_time to whatever's now current.
+        This is what makes editing (vs. delete-and-re-add) meaningfully
+        different for the Generate/Refresh distinction.
+        """
+        task = Task("Morning walk", 30, priority=2, type="walk", scheduled_time="08:00")
+        assert task.original_scheduled_time == "08:00"
+        assert task.exclusive_attention is False
+
+        # Simulate an edit: change type to grooming and bump duration
+        task.type = "grooming"
+        task.duration = 20
+        task.scheduled_time = "09:00"
+        task.__post_init__()
+
+        assert task.exclusive_attention is True          # re-derived from the new type
+        assert task.original_scheduled_time == "09:00"    # the edit is the new baseline
+        assert task.scheduled_time == "09:00"
+
+    def test_editing_priority_can_flip_the_tie_break_outcome_on_generate(self):
+        """
+        Editing a task's priority (without touching its time) should leave
+        Refresh's already-resolved plan untouched, but Generate must
+        re-litigate the tie-break with the new priority and can arrive at a
+        genuinely different (and correct) outcome — this is the strongest
+        proof that editing + Generate/Refresh together do meaningful work,
+        not just cosmetic labeling.
+        """
+        owner = Owner(name="Alex")
+        owner.set_availability(
+            work_schedule="office", available_hours=5,
+            preferred_morning_start="07:00", preferred_evening_end="20:00",
+        )
+        buddy = Pet(name="Buddy", species="Dog", gender="Male", age=3)
+        luna = Pet(name="Luna", species="Cat", gender="Female", age=2)
+        buddy.add_task(Task("Morning walk", 30, priority=2, type="walk", scheduled_time="08:00"))
+        luna.add_task(Task("Brushing", 15, priority=3, type="grooming", scheduled_time="08:00"))
+        owner.add_pet(buddy)
+        owner.add_pet(luna)
+
+        scheduler = Scheduler(owner=owner)
+        scheduler.generate_plan()
+        brushing = next(t for t in luna.get_tasks() if t.name == "Brushing")
+        walk = next(t for t in buddy.get_tasks() if t.name == "Morning walk")
+        assert walk.scheduled_time == "08:00" and brushing.scheduled_time == "08:35"
+
+        # Edit: lower walk's priority below Brushing's
+        walk.priority = 4
+        walk.__post_init__()
+
+        # Refresh: keeps the stale resolution from before the edit
+        scheduler.generate_plan()
+        assert walk.scheduled_time == "08:00"
+        assert brushing.scheduled_time == "08:35"
+        assert scheduler.attempt_log == []
+
+        # Generate: resets both to original 08:00 and re-solves with the
+        # edited priority — Brushing now wins, walk shifts instead
+        scheduler.generate_plan(reset_to_original=True)
+        assert brushing.scheduled_time == "08:00"
+        assert walk.scheduled_time == "08:20"
+        assert len(scheduler.attempt_log) == 1
