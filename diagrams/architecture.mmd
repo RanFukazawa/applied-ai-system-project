@@ -1,8 +1,10 @@
 flowchart TD
     subgraph Input["Input"]
         U[Owner, Pet, Task data<br/>entered/edited via app.py or main.py]
+    end
+
+    subgraph RAG["Retrieval - RAG component"]
         RULES[(task_rules.json<br/>type -> attention_required,<br/>exclusive_attention, reason)]
-        RULES -.retrieved at Task creation<br/>and re-derived on edit.-> U
     end
 
     subgraph Agent["Agent - Scheduler (pawpal_system.py)"]
@@ -32,6 +34,8 @@ flowchart TD
         H[Owner reviews plan,<br/>edits tasks in place,<br/>adds/removes pets or tasks,<br/>adjusts availability]
     end
 
+    RULES -.retrieved at Task creation<br/>and re-derived on edit.-> U
+    RULES -.retrieved fields directly<br/>drive this decision.-> C
     U --> G
     FIN --> O1
     FIN --> O2
